@@ -108,6 +108,8 @@ const DBWIN_BUFFER_READY_EVENT_NAME = "DBWIN_BUFFER_READY";
 const DBWIN_DATA_READY_EVENT_NAME = "DBWIN_DATA_READY";
 
 pub fn main() !void {
+    const stdout = std.io.getStdOut().writer();
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
 
@@ -259,6 +261,6 @@ pub fn main() !void {
 
         const max_pid_len = comptime std.fmt.count("{d}", .{std.math.maxInt(u32)});
         const max_pid_len_str = std.fmt.comptimePrint("{d}", .{max_pid_len});
-        std.debug.print("{d: >" ++ max_pid_len_str ++ "}: {s}\n", .{ pid, msg_trimmed });
+        try stdout.print("{d: >" ++ max_pid_len_str ++ "}: {s}\n", .{ pid, msg_trimmed });
     }
 }
