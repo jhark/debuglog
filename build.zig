@@ -17,6 +17,13 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("kernel32");
     exe.linkSystemLibrary("advapi32");
 
+    const flags_dep = b.dependency("flags", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    exe.root_module.addImport("flags", flags_dep.module("flags"));
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

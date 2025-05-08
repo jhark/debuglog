@@ -1,9 +1,31 @@
 const std = @import("std");
 const windows = std.os.windows;
 const kernel32 = windows.kernel32;
+const flags = @import("flags");
 
 // Configuration
 const IGNORE_EMPTY_MESSAGES = true;
+
+// Command line options
+const Flags = struct {
+    pub const description =
+        \\Captures messages sent by applications using OutputDebugStringA and prints them to stdout.
+        \\
+        \\Example:
+        \\  debuglog -p 1234    # Show only messages from process ID 1234
+        \\  debuglog            # Show messages from all processes
+    ;
+
+    pub const descriptions = .{
+        .pid = "Filter messages to show only those from the specified process ID",
+    };
+
+    pub const switches = .{
+        .pid = 'p',
+    };
+
+    pid: ?u32 = null,
+};
 
 // Windows API.
 const BOOL = windows.BOOL;
@@ -86,6 +108,23 @@ const DBWIN_BUFFER_READY_EVENT_NAME = "DBWIN_BUFFER_READY";
 const DBWIN_DATA_READY_EVENT_NAME = "DBWIN_DATA_READY";
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
+    defer _ = gpa.deinit();
+
+    const args = try std.process.argsAlloc(gpa.allocator());
+    defer std.process.argsFree(gpa.allocator(), args);
+
+    const colors = &flags.ColorScheme{
+        .error_label = &.{ .bright_red, .bold },
+        .command_name = &.{.bright_green},
+        .header = &.{ .yellow, .bold },
+        .usage = &.{.dim},
+    };
+
+    const flags_ = flags.parseOrExit(args, "debuglog", Flags, .{
+        .colors = colors,
+    });
+
     var sec_desc: SECURITY_DESCRIPTOR = undefined;
     if (InitializeSecurityDescriptor(&sec_desc, 1) == FALSE) {
         std.debug.print("Failed to initialize security descriptor: {any}\n", .{windows.GetLastError()});
@@ -209,6 +248,13 @@ pub fn main() !void {
         const msg_trimmed = std.mem.trim(u8, msg, " \n\r\t");
         if (IGNORE_EMPTY_MESSAGES and msg_trimmed.len == 0) {
             continue;
+        }
+
+        // Filter by PID if specified
+        if (flags_.pid) |filter_pid| {
+            if (pid != filter_pid) {
+                continue;
+            }
         }
 
         const max_pid_len = comptime std.fmt.count("{d}", .{std.math.maxInt(u32)});
