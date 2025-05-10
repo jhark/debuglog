@@ -126,12 +126,124 @@ extern "kernel32" fn WaitForMultipleObjects(
     dwMilliseconds: DWORD,
 ) callconv(WINAPI) DWORD;
 
-// Debug memory window constants.
-const DBWIN_BUFFER_SIZE = 4096;
-const DBWIN_MUTEX_NAME = "DBWIN_MUTEX";
-const DBWIN_SHARED_MEM_NAME = "DBWIN_BUFFER";
-const DBWIN_BUFFER_READY_EVENT_NAME = "DBWIN_BUFFER_READY";
-const DBWIN_DATA_READY_EVENT_NAME = "DBWIN_DATA_READY";
+const DebugObjects = struct {
+    const DBWIN_BUFFER_SIZE = 4096;
+    const DBWIN_MUTEX_NAME = "DBWIN_MUTEX";
+    const DBWIN_SHARED_MEM_NAME = "DBWIN_BUFFER";
+    const DBWIN_BUFFER_READY_EVENT_NAME = "DBWIN_BUFFER_READY";
+    const DBWIN_DATA_READY_EVENT_NAME = "DBWIN_DATA_READY";
+
+    shmem_mutex: HANDLE,
+    buffer_ready_event: HANDLE,
+    data_ready_event: HANDLE,
+    shmem_mapping: HANDLE,
+    shmem: []u8,
+
+    fn init() DebugObjects {
+        var sec_desc: SECURITY_DESCRIPTOR = undefined;
+        if (InitializeSecurityDescriptor(&sec_desc, 1) == FALSE) {
+            std.log.err("Failed to initialize security descriptor: {any}", .{windows.GetLastError()});
+            std.process.exit(1);
+        }
+
+        var sec_attrs = SECURITY_ATTRIBUTES{
+            .nLength = @sizeOf(SECURITY_ATTRIBUTES),
+            .lpSecurityDescriptor = &sec_desc,
+            .bInheritHandle = FALSE,
+        };
+
+        const shmem_mutex = CreateMutexA(
+            &sec_attrs,
+            FALSE, // Not initially owned
+            DBWIN_MUTEX_NAME,
+        ) orelse {
+            std.log.err("Failed to create/open DBWIN_MUTEX: {any}", .{windows.GetLastError()});
+            std.process.exit(1);
+        };
+
+        // Acquire mutex for initialization
+        switch (WaitForSingleObject(shmem_mutex, INFINITE)) {
+            WAIT_OBJECT_0 => {},
+            WAIT_FAILED => {
+                std.log.err("WaitForSingleObject (DBWIN_MUTEX) failed: {any}", .{windows.GetLastError()});
+                std.process.exit(1);
+            },
+            else => {
+                std.log.err("WaitForSingleObject (DBWIN_MUTEX) returned an unexpected value", .{});
+                std.process.exit(1);
+            },
+        }
+
+        const buffer_ready_event = CreateEventA(
+            &sec_attrs,
+            FALSE, // Auto-reset event
+            FALSE, // Initially non-signaled
+            DBWIN_BUFFER_READY_EVENT_NAME,
+        ) orelse {
+            std.log.err("Failed to create/open DBWIN_BUFFER_READY event: {any}", .{windows.GetLastError()});
+            std.process.exit(1);
+        };
+
+        const data_ready_event = CreateEventA(
+            &sec_attrs,
+            FALSE, // Auto-reset event
+            FALSE, // Initially non-signaled
+            DBWIN_DATA_READY_EVENT_NAME,
+        ) orelse {
+            std.log.err("Failed to create/open DBWIN_DATA_READY event: {any}", .{windows.GetLastError()});
+            std.process.exit(1);
+        };
+
+        const shmem_mapping = CreateFileMappingA(
+            INVALID_HANDLE_VALUE, // Use paging file
+            &sec_attrs, // Default security
+            PAGE_READWRITE,
+            0,
+            DBWIN_BUFFER_SIZE,
+            DBWIN_SHARED_MEM_NAME,
+        ) orelse {
+            std.log.err("Failed to create/open shared memory mapping: {any}", .{windows.GetLastError()});
+            std.process.exit(1);
+        };
+
+        const shmem = MapViewOfFile(
+            shmem_mapping,
+            FILE_MAP_READ,
+            0,
+            0,
+            DBWIN_BUFFER_SIZE,
+        ) orelse {
+            std.log.err("Failed to map view of file: {any}", .{windows.GetLastError()});
+            std.process.exit(1);
+        };
+
+        if (ReleaseMutex(shmem_mutex) == FALSE) {
+            std.log.err("Failed to release DBWIN_MUTEX: {any}", .{windows.GetLastError()});
+            std.process.exit(1);
+        }
+
+        const shmem_buf = @as([*]u8, @ptrCast(shmem))[0..DBWIN_BUFFER_SIZE];
+
+        return DebugObjects{
+            .shmem_mutex = shmem_mutex,
+            .buffer_ready_event = buffer_ready_event,
+            .data_ready_event = data_ready_event,
+            .shmem_mapping = shmem_mapping,
+            .shmem = shmem_buf,
+        };
+    }
+
+    fn deinit(self: *DebugObjects) void {
+        if (UnmapViewOfFile(self.shmem.ptr) == windows.FALSE) {
+            std.log.err("UnmapViewOfFile: {any}", .{windows.GetLastError()});
+        }
+
+        windows.CloseHandle(self.shmem_mapping);
+        windows.CloseHandle(self.data_ready_event);
+        windows.CloseHandle(self.buffer_ready_event);
+        windows.CloseHandle(self.shmem_mutex);
+    }
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
@@ -195,96 +307,11 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
+    var debug_objects = DebugObjects.init();
+    defer debug_objects.deinit();
+
     var filter_pid: ?u32 = flags_.pid;
     var child: ?std.process.Child = null;
-
-    // Initialize debug objects
-    var sec_desc: SECURITY_DESCRIPTOR = undefined;
-    if (InitializeSecurityDescriptor(&sec_desc, 1) == FALSE) {
-        std.log.err("Failed to initialize security descriptor: {any}", .{windows.GetLastError()});
-        std.process.exit(1);
-    }
-
-    var sec_attrs = SECURITY_ATTRIBUTES{
-        .nLength = @sizeOf(SECURITY_ATTRIBUTES),
-        .lpSecurityDescriptor = &sec_desc,
-        .bInheritHandle = FALSE,
-    };
-
-    const shmem_mutex = CreateMutexA(
-        &sec_attrs,
-        FALSE, // Not initially owned
-        DBWIN_MUTEX_NAME,
-    ) orelse {
-        std.log.err("Failed to create/open DBWIN_MUTEX: {any}", .{windows.GetLastError()});
-        std.process.exit(1);
-    };
-    defer _ = windows.CloseHandle(shmem_mutex);
-
-    // Acquire mutex for initialization
-    switch (WaitForSingleObject(shmem_mutex, INFINITE)) {
-        WAIT_OBJECT_0 => {},
-        WAIT_FAILED => {
-            std.log.err("WaitForSingleObject (DBWIN_MUTEX) failed: {any}", .{windows.GetLastError()});
-            std.process.exit(1);
-        },
-        else => {
-            std.log.err("WaitForSingleObject (DBWIN_MUTEX) returned an unexpected value", .{});
-            std.process.exit(1);
-        },
-    }
-
-    const buffer_ready_event = CreateEventA(
-        &sec_attrs,
-        FALSE, // Auto-reset event
-        FALSE, // Initially non-signaled
-        DBWIN_BUFFER_READY_EVENT_NAME,
-    ) orelse {
-        std.log.err("Failed to create/open DBWIN_BUFFER_READY event: {any}", .{windows.GetLastError()});
-        std.process.exit(1);
-    };
-    defer _ = windows.CloseHandle(buffer_ready_event);
-
-    const data_ready_event = CreateEventA(
-        &sec_attrs,
-        FALSE, // Auto-reset event
-        FALSE, // Initially non-signaled
-        DBWIN_DATA_READY_EVENT_NAME,
-    ) orelse {
-        std.log.err("Failed to create/open DBWIN_DATA_READY event: {any}", .{windows.GetLastError()});
-        std.process.exit(1);
-    };
-    defer _ = windows.CloseHandle(data_ready_event);
-
-    const shmem_mapping = CreateFileMappingA(
-        INVALID_HANDLE_VALUE, // Use paging file
-        &sec_attrs, // Default security
-        PAGE_READWRITE,
-        0,
-        DBWIN_BUFFER_SIZE,
-        DBWIN_SHARED_MEM_NAME,
-    ) orelse {
-        std.log.err("Failed to create/open shared memory mapping: {any}", .{windows.GetLastError()});
-        std.process.exit(1);
-    };
-    defer _ = windows.CloseHandle(shmem_mapping);
-
-    const shmem = MapViewOfFile(
-        shmem_mapping,
-        FILE_MAP_READ,
-        0,
-        0,
-        DBWIN_BUFFER_SIZE,
-    ) orelse {
-        std.log.err("Failed to map view of file: {any}", .{windows.GetLastError()});
-        std.process.exit(1);
-    };
-    defer _ = UnmapViewOfFile(shmem);
-
-    if (ReleaseMutex(shmem_mutex) == FALSE) {
-        std.log.err("Failed to release DBWIN_MUTEX: {any}", .{windows.GetLastError()});
-        std.process.exit(1);
-    }
 
     // Launch subprocess if specified
     if (flags_.positional.trailing.len > 0) {
@@ -315,11 +342,9 @@ pub fn main() !void {
         _ = child.?.wait() catch {};
     };
 
-    const shmem_buf = @as([*]u8, @ptrCast(shmem))[0..DBWIN_BUFFER_SIZE];
-
     const child_wait_handle_index = 1;
     var wait_handles: [2]HANDLE = undefined;
-    wait_handles[0] = data_ready_event;
+    wait_handles[0] = debug_objects.data_ready_event;
     if (child) |c| {
         wait_handles[child_wait_handle_index] = c.id;
     }
@@ -327,7 +352,7 @@ pub fn main() !void {
 
     while (true) {
         // The buffer is available for writing.
-        if (SetEvent(buffer_ready_event) == FALSE) {
+        if (SetEvent(debug_objects.buffer_ready_event) == FALSE) {
             std.log.err("Failed to set DBWIN_BUFFER_READY event: {any}", .{windows.GetLastError()});
             std.process.exit(1);
         }
@@ -345,9 +370,9 @@ pub fn main() !void {
             WAIT_OBJECT_0 => {
                 // Read 4 byte PID followed by null-terminated message.
                 const Pid = u32;
-                const pid = std.mem.bytesToValue(Pid, shmem_buf[0..@sizeOf(Pid)]);
+                const pid = std.mem.bytesToValue(Pid, debug_objects.shmem[0..@sizeOf(Pid)]);
 
-                const msg_buf = shmem_buf[@sizeOf(Pid)..];
+                const msg_buf = debug_objects.shmem[@sizeOf(Pid)..];
                 const msg_end = std.mem.indexOfScalar(u8, msg_buf, 0) orelse {
                     std.log.err("Error: Message is not null-terminated, discarding.", .{});
                     continue;
