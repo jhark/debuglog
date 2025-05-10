@@ -21,13 +21,22 @@ const Flags = struct {
 
     pub const descriptions = .{
         .pid = "Filter messages to show only those from the specified process ID",
+        .stderr = "Send output to stderr",
+        .stdout = "Send output to stdout",
+        .file = "Send output to the specified file",
     };
 
     pub const switches = .{
         .pid = 'p',
+        .stderr = 'e',
+        .stdout = 'o',
+        .file = 'f',
     };
 
     pid: ?u32 = null,
+    stderr: bool = false,
+    stdout: bool = false,
+    file: ?[]const u8 = null,
     positional: struct {
         trailing: []const []const u8,
     },
@@ -125,10 +134,6 @@ const DBWIN_BUFFER_READY_EVENT_NAME = "DBWIN_BUFFER_READY";
 const DBWIN_DATA_READY_EVENT_NAME = "DBWIN_DATA_READY";
 
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
-    const stderr = std.io.getStdErr().writer();
-    var out = stdout;
-
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
 
@@ -145,6 +150,44 @@ pub fn main() !void {
     const flags_ = flags.parseOrExit(args, "debuglog", Flags, .{
         .colors = colors,
     });
+
+    // Set output destination
+    const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
+    var out = stdout;
+    {
+        {
+            var output_options_count: u8 = 0;
+            if (flags_.stderr) output_options_count += 1;
+            if (flags_.stdout) output_options_count += 1;
+            if (flags_.file != null) output_options_count += 1;
+
+            if (output_options_count > 1) {
+                std.log.err("Error: Only one output destination can be specified", .{});
+                std.process.exit(1);
+            }
+        }
+
+        if (flags_.positional.trailing.len > 0) {
+            out = stderr;
+        }
+
+        if (flags_.stderr) {
+            out = stderr;
+        }
+
+        if (flags_.stdout) {
+            out = stdout;
+        }
+
+        if (flags_.file) |file_path| {
+            const file = std.fs.cwd().createFile(file_path, .{}) catch |e| {
+                std.log.err("Failed to create output file: {}", .{e});
+                std.process.exit(1);
+            };
+            out = file.writer();
+        }
+    }
 
     // Validate that pid and subprocess are not used together
     if (flags_.pid != null and flags_.positional.trailing.len > 0) {
