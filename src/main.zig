@@ -9,11 +9,14 @@ const IGNORE_EMPTY_MESSAGES = true;
 // Command line options
 const Flags = struct {
     pub const description =
-        \\Captures messages sent by applications using OutputDebugStringA and prints them to stdout.
+        \\Captures messages sent by applications using OutputDebugStringA and prints them.
         \\
         \\Example:
-        \\  debuglog -p 1234    # Show only messages from process ID 1234
-        \\  debuglog            # Show messages from all processes
+        \\  debuglog                   # Print messages from all processes
+        \\  debuglog -p 1234           # Print messages from process with PID 1234
+        \\  debuglog -- app.exe --foo  # Launch `app.exe --foo` and print only its messages.
+        \\
+        \\Messages are printed to stdout by default, or to stderr when spawning a subprocess.
     ;
 
     pub const descriptions = .{
@@ -25,6 +28,9 @@ const Flags = struct {
     };
 
     pid: ?u32 = null,
+    positional: struct {
+        trailing: []const []const u8,
+    },
 };
 
 // Windows API.
@@ -100,6 +106,17 @@ extern "kernel32" fn ReleaseMutex(
     hMutex: HANDLE,
 ) callconv(WINAPI) BOOL;
 
+extern "kernel32" fn GetProcessId(
+    Process: HANDLE,
+) callconv(WINAPI) DWORD;
+
+extern "kernel32" fn WaitForMultipleObjects(
+    nCount: DWORD,
+    lpHandles: [*]const HANDLE,
+    bWaitAll: BOOL,
+    dwMilliseconds: DWORD,
+) callconv(WINAPI) DWORD;
+
 // Debug memory window constants.
 const DBWIN_BUFFER_SIZE = 4096;
 const DBWIN_MUTEX_NAME = "DBWIN_MUTEX";
@@ -109,6 +126,8 @@ const DBWIN_DATA_READY_EVENT_NAME = "DBWIN_DATA_READY";
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
+    var out = stdout;
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gpa.deinit();
@@ -127,10 +146,20 @@ pub fn main() !void {
         .colors = colors,
     });
 
+    // Validate that pid and subprocess are not used together
+    if (flags_.pid != null and flags_.positional.trailing.len > 0) {
+        std.log.err("Error: Cannot use -p option together with subprocess command", .{});
+        std.process.exit(1);
+    }
+
+    var filter_pid: ?u32 = flags_.pid;
+    var child: ?std.process.Child = null;
+
+    // Initialize debug objects
     var sec_desc: SECURITY_DESCRIPTOR = undefined;
     if (InitializeSecurityDescriptor(&sec_desc, 1) == FALSE) {
-        std.debug.print("Failed to initialize security descriptor: {any}\n", .{windows.GetLastError()});
-        return;
+        std.log.err("Failed to initialize security descriptor: {any}", .{windows.GetLastError()});
+        std.process.exit(1);
     }
 
     var sec_attrs = SECURITY_ATTRIBUTES{
@@ -144,8 +173,8 @@ pub fn main() !void {
         FALSE, // Not initially owned
         DBWIN_MUTEX_NAME,
     ) orelse {
-        std.debug.print("Failed to create/open DBWIN_MUTEX: {any}\n", .{windows.GetLastError()});
-        return;
+        std.log.err("Failed to create/open DBWIN_MUTEX: {any}", .{windows.GetLastError()});
+        std.process.exit(1);
     };
     defer _ = windows.CloseHandle(shmem_mutex);
 
@@ -153,12 +182,12 @@ pub fn main() !void {
     switch (WaitForSingleObject(shmem_mutex, INFINITE)) {
         WAIT_OBJECT_0 => {},
         WAIT_FAILED => {
-            std.debug.print("WaitForSingleObject (DBWIN_MUTEX) failed: {any}\n", .{windows.GetLastError()});
-            return;
+            std.log.err("WaitForSingleObject (DBWIN_MUTEX) failed: {any}", .{windows.GetLastError()});
+            std.process.exit(1);
         },
         else => {
-            std.debug.print("WaitForSingleObject (DBWIN_MUTEX) returned an unexpected value\n", .{});
-            return;
+            std.log.err("WaitForSingleObject (DBWIN_MUTEX) returned an unexpected value", .{});
+            std.process.exit(1);
         },
     }
 
@@ -168,8 +197,8 @@ pub fn main() !void {
         FALSE, // Initially non-signaled
         DBWIN_BUFFER_READY_EVENT_NAME,
     ) orelse {
-        std.debug.print("Failed to create/open DBWIN_BUFFER_READY event: {any}\n", .{windows.GetLastError()});
-        return;
+        std.log.err("Failed to create/open DBWIN_BUFFER_READY event: {any}", .{windows.GetLastError()});
+        std.process.exit(1);
     };
     defer _ = windows.CloseHandle(buffer_ready_event);
 
@@ -179,8 +208,8 @@ pub fn main() !void {
         FALSE, // Initially non-signaled
         DBWIN_DATA_READY_EVENT_NAME,
     ) orelse {
-        std.debug.print("Failed to create/open DBWIN_DATA_READY event: {any}\n", .{windows.GetLastError()});
-        return;
+        std.log.err("Failed to create/open DBWIN_DATA_READY event: {any}", .{windows.GetLastError()});
+        std.process.exit(1);
     };
     defer _ = windows.CloseHandle(data_ready_event);
 
@@ -192,8 +221,8 @@ pub fn main() !void {
         DBWIN_BUFFER_SIZE,
         DBWIN_SHARED_MEM_NAME,
     ) orelse {
-        std.debug.print("Failed to create/open shared memory mapping: {any}\n", .{windows.GetLastError()});
-        return;
+        std.log.err("Failed to create/open shared memory mapping: {any}", .{windows.GetLastError()});
+        std.process.exit(1);
     };
     defer _ = windows.CloseHandle(shmem_mapping);
 
@@ -204,63 +233,127 @@ pub fn main() !void {
         0,
         DBWIN_BUFFER_SIZE,
     ) orelse {
-        std.debug.print("Failed to map view of file: {any}\n", .{windows.GetLastError()});
-        return;
+        std.log.err("Failed to map view of file: {any}", .{windows.GetLastError()});
+        std.process.exit(1);
     };
     defer _ = UnmapViewOfFile(shmem);
 
     if (ReleaseMutex(shmem_mutex) == FALSE) {
-        std.debug.print("Failed to release DBWIN_MUTEX: {any}\n", .{windows.GetLastError()});
-        return;
+        std.log.err("Failed to release DBWIN_MUTEX: {any}", .{windows.GetLastError()});
+        std.process.exit(1);
     }
 
+    // Launch subprocess if specified
+    if (flags_.positional.trailing.len > 0) {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd_path = try std.fs.cwd().realpath(".", cwd_buf[0..]);
+
+        std.log.debug("spawn: {s}", .{flags_.positional.trailing});
+        child = std.process.Child.init(flags_.positional.trailing, gpa.allocator());
+        child.?.cwd = cwd_path;
+        child.?.spawn() catch |e| {
+            std.log.err("Failed to spawn child process: {}", .{e});
+            std.process.exit(1);
+        };
+
+        const pid = GetProcessId(child.?.id);
+        if (pid == 0) {
+            std.log.err("Failed to get process ID: {any}", .{windows.GetLastError()});
+            std.process.exit(1);
+        }
+
+        out = stderr;
+        filter_pid = pid;
+    }
+
+    // Clean up child process on exit
+    defer if (child) |_| {
+        _ = child.?.kill() catch {};
+        _ = child.?.wait() catch {};
+    };
+
     const shmem_buf = @as([*]u8, @ptrCast(shmem))[0..DBWIN_BUFFER_SIZE];
+
+    const child_wait_handle_index = 1;
+    var wait_handles: [2]HANDLE = undefined;
+    wait_handles[0] = data_ready_event;
+    if (child) |c| {
+        wait_handles[child_wait_handle_index] = c.id;
+    }
+    const wait_handle_count: DWORD = if (child != null) 2 else 1;
+
     while (true) {
         // The buffer is available for writing.
         if (SetEvent(buffer_ready_event) == FALSE) {
-            std.debug.print("Failed to set DBWIN_BUFFER_READY event: {any}\n", .{windows.GetLastError()});
-            return;
+            std.log.err("Failed to set DBWIN_BUFFER_READY event: {any}", .{windows.GetLastError()});
+            std.process.exit(1);
         }
 
-        // Wait until the buffer has been written to.
-        switch (WaitForSingleObject(data_ready_event, INFINITE)) {
-            WAIT_OBJECT_0 => {},
+        // Wait for either the data ready event or child process exit.
+        const wait_result = WaitForMultipleObjects(
+            wait_handle_count,
+            &wait_handles,
+            FALSE,
+            INFINITE,
+        );
+
+        switch (wait_result) {
+            // Data ready event signalled.
+            WAIT_OBJECT_0 => {
+                // Read 4 byte PID followed by null-terminated message.
+                const Pid = u32;
+                const pid = std.mem.bytesToValue(Pid, shmem_buf[0..@sizeOf(Pid)]);
+
+                const msg_buf = shmem_buf[@sizeOf(Pid)..];
+                const msg_end = std.mem.indexOfScalar(u8, msg_buf, 0) orelse {
+                    std.log.err("Error: Message is not null-terminated, discarding.", .{});
+                    continue;
+                };
+                const msg = msg_buf[0..msg_end];
+
+                // Print.
+                const msg_trimmed = std.mem.trim(u8, msg, " \n\r\t");
+                if (IGNORE_EMPTY_MESSAGES and msg_trimmed.len == 0) {
+                    continue;
+                }
+
+                if (filter_pid) |pid_to_filter| {
+                    if (pid != pid_to_filter) continue;
+                }
+
+                const max_pid_len = comptime std.fmt.count("{d}", .{std.math.maxInt(u32)});
+                const max_pid_len_str = std.fmt.comptimePrint("{d}", .{max_pid_len});
+                try out.print("{d: >" ++ max_pid_len_str ++ "}: {s}\n", .{ pid, msg_trimmed });
+            },
+
+            // Child process handle signalled.
+            WAIT_OBJECT_0 + child_wait_handle_index => {
+                std.log.debug("Child process exited.", .{});
+
+                const term_state = child.?.wait() catch {
+                    std.log.err("Failed to get child process exit code", .{});
+                    std.process.exit(1);
+                };
+                switch (term_state) {
+                    .Exited => |exit_code| {
+                        std.process.exit(exit_code);
+                    },
+                    else => {
+                        std.log.err("Child process exited abnormally: {}", .{term_state});
+                        std.process.exit(1);
+                    },
+                }
+            },
+
             WAIT_FAILED => {
-                std.debug.print("WaitForSingleObject (DBWIN_DATA_READY) failed: {any}\n", .{windows.GetLastError()});
-                return;
+                std.log.err("WaitForMultipleObjects failed: {any}", .{windows.GetLastError()});
+                std.process.exit(1);
             },
+
             else => {
-                std.debug.print("WaitForSingleObject (DBWIN_DATA_READY) returned an unexpected value\n", .{});
-                return;
+                std.log.err("WaitForMultipleObjects returned an unexpected value", .{});
+                std.process.exit(1);
             },
         }
-
-        // Read 4 byte PID followed by null-terminated message.
-        const Pid = u32;
-        const pid = std.mem.bytesToValue(Pid, shmem_buf[0..@sizeOf(Pid)]);
-
-        const msg_buf = shmem_buf[@sizeOf(Pid)..];
-        const msg_end = std.mem.indexOfScalar(u8, msg_buf, 0) orelse {
-            std.debug.print("Error: Message is not null-terminated, discarding.\n", .{});
-            continue;
-        };
-        const msg = msg_buf[0..msg_end];
-
-        // Print.
-        const msg_trimmed = std.mem.trim(u8, msg, " \n\r\t");
-        if (IGNORE_EMPTY_MESSAGES and msg_trimmed.len == 0) {
-            continue;
-        }
-
-        // Filter by PID if specified
-        if (flags_.pid) |filter_pid| {
-            if (pid != filter_pid) {
-                continue;
-            }
-        }
-
-        const max_pid_len = comptime std.fmt.count("{d}", .{std.math.maxInt(u32)});
-        const max_pid_len_str = std.fmt.comptimePrint("{d}", .{max_pid_len});
-        try stdout.print("{d: >" ++ max_pid_len_str ++ "}: {s}\n", .{ pid, msg_trimmed });
     }
 }
