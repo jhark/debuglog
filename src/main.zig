@@ -144,7 +144,9 @@ const DebugObjects = struct {
     const DBWIN_SHARED_MEM_NAME = "DBWIN_BUFFER";
     const DBWIN_BUFFER_READY_EVENT_NAME = "DBWIN_BUFFER_READY";
     const DBWIN_DATA_READY_EVENT_NAME = "DBWIN_DATA_READY";
+    const DEBUGLOG_MUTEX_NAME = "f698ccec3d254735b2f188be68c53e80"; // Arbitrary unique name.
 
+    debuglog_mutex: HANDLE,
     shmem_mutex: HANDLE,
     buffer_ready_event: HANDLE,
     data_ready_event: HANDLE,
@@ -152,6 +154,20 @@ const DebugObjects = struct {
     shmem: []u8,
 
     fn init() DebugObjects {
+        const debuglog_mutex = CreateMutexA(
+            null,
+            FALSE, // Not initially owned
+            DEBUGLOG_MUTEX_NAME,
+        ) orelse {
+            std.log.err("Failed to create/open {s}: {any}", .{ DEBUGLOG_MUTEX_NAME, windows.GetLastError() });
+            std.process.exit(1);
+        };
+
+        if (windows.GetLastError() == windows.Win32Error.ALREADY_EXISTS) {
+            std.log.err("Another instance of debuglog is already running.", .{});
+            std.process.exit(1);
+        }
+
         var sec_desc: SECURITY_DESCRIPTOR = undefined;
         if (InitializeSecurityDescriptor(&sec_desc, 1) == FALSE) {
             std.log.err("Failed to initialize security descriptor: {any}", .{windows.GetLastError()});
@@ -169,9 +185,13 @@ const DebugObjects = struct {
             FALSE, // Not initially owned
             DBWIN_MUTEX_NAME,
         ) orelse {
-            std.log.err("Failed to create/open DBWIN_MUTEX: {any}", .{windows.GetLastError()});
+            std.log.err("Failed to create/open {s}: {any}", .{ DBWIN_MUTEX_NAME, windows.GetLastError() });
             std.process.exit(1);
         };
+
+        if (windows.GetLastError() == windows.Win32Error.ALREADY_EXISTS) {
+            std.log.warn("The debug log is already open. If there are any other readers then output will be unpredictable.", .{});
+        }
 
         // Acquire mutex for initialization
         switch (WaitForSingleObject(shmem_mutex, INFINITE)) {
@@ -237,6 +257,7 @@ const DebugObjects = struct {
         const shmem_buf = @as([*]u8, @ptrCast(shmem))[0..DBWIN_BUFFER_SIZE];
 
         return DebugObjects{
+            .debuglog_mutex = debuglog_mutex,
             .shmem_mutex = shmem_mutex,
             .buffer_ready_event = buffer_ready_event,
             .data_ready_event = data_ready_event,
@@ -254,6 +275,7 @@ const DebugObjects = struct {
         windows.CloseHandle(self.data_ready_event);
         windows.CloseHandle(self.buffer_ready_event);
         windows.CloseHandle(self.shmem_mutex);
+        windows.CloseHandle(self.debuglog_mutex);
     }
 };
 
