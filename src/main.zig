@@ -6,6 +6,11 @@ const flags = @import("flags");
 // Configuration
 const IGNORE_EMPTY_MESSAGES = true;
 
+const OutputFormat = enum {
+    plain_text,
+    json,
+};
+
 // Command line options
 const Flags = struct {
     pub const description =
@@ -24,6 +29,7 @@ const Flags = struct {
         .stderr = "Send output to stderr",
         .stdout = "Send output to stdout",
         .file = "Send output to the specified file",
+        .json = "Output messages in JSON format",
     };
 
     pub const switches = .{
@@ -31,15 +37,21 @@ const Flags = struct {
         .stderr = 'e',
         .stdout = 'o',
         .file = 'f',
+        .json = 'j',
     };
 
     pid: ?u32 = null,
     stderr: bool = false,
     stdout: bool = false,
     file: ?[]const u8 = null,
+    json: bool = false,
     positional: struct {
         trailing: []const []const u8,
     },
+
+    fn getOutputFormat(self: Flags) OutputFormat {
+        return if (self.json) .json else .plain_text;
+    }
 };
 
 // Windows API.
@@ -379,19 +391,14 @@ pub fn main() !void {
                 };
                 const msg = msg_buf[0..msg_end];
 
-                // Print.
-                const msg_trimmed = std.mem.trim(u8, msg, " \n\r\t");
-                if (IGNORE_EMPTY_MESSAGES and msg_trimmed.len == 0) {
-                    continue;
-                }
-
                 if (filter_pid) |pid_to_filter| {
                     if (pid != pid_to_filter) continue;
                 }
 
-                const max_pid_len = comptime std.fmt.count("{d}", .{std.math.maxInt(u32)});
-                const max_pid_len_str = std.fmt.comptimePrint("{d}", .{max_pid_len});
-                try out.print("{d: >" ++ max_pid_len_str ++ "}: {s}\n", .{ pid, msg_trimmed });
+                handleMsg(out, pid, msg, flags_.getOutputFormat()) catch |e| {
+                    std.log.err("Failed to handle message: {}", .{e});
+                    std.process.exit(1);
+                };
             },
 
             // Child process handle signalled.
@@ -423,5 +430,28 @@ pub fn main() !void {
                 std.process.exit(1);
             },
         }
+    }
+}
+
+fn handleMsg(out: anytype, pid: u32, msg: []const u8, format: OutputFormat) !void {
+    const msg_trimmed = std.mem.trim(u8, msg, " \n\r\t");
+    if (IGNORE_EMPTY_MESSAGES and msg_trimmed.len == 0) {
+        return;
+    }
+
+    switch (format) {
+        .json => {
+            try std.json.stringify(.{
+                .pid = pid,
+                .msg = msg_trimmed,
+            }, .{}, out);
+
+            try out.print("\n", .{});
+        },
+        .plain_text => {
+            const max_pid_len = comptime std.fmt.count("{d}", .{std.math.maxInt(u32)});
+            const max_pid_len_str = std.fmt.comptimePrint("{d}", .{max_pid_len});
+            try out.print("{d: >" ++ max_pid_len_str ++ "}: {s}\n", .{ pid, msg_trimmed });
+        },
     }
 }
